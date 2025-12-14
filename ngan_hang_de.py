@@ -430,21 +430,45 @@ def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 
+def has_equation(run):
+    """Kiểm tra xem run có chứa công thức hay không"""
+    try:
+        xml_str = run.element.xml
+        return ('<m:oMath' in xml_str or 
+                '<m:oMathPara' in xml_str or 
+                '<w:object' in xml_str and '<o:OLEObject' in xml_str)
+    except:
+        return False
+
+
 def get_equation_xml(run):
     """Trích xuất XML của công thức toán học (Equation/MathType)"""
     try:
         xml_str = run.element.xml
         root = etree.fromstring(xml_str)
 
+        # Namespace definitions
         MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
-
+        W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        
+        # Try to find Office Math (modern equations)
         omath = root.find(f'.//{{{MATH_NS}}}oMath')
         if omath is not None:
+            # Return the entire parent element to preserve structure
+            omath_para = root.find(f'.//{{{MATH_NS}}}oMathPara')
+            if omath_para is not None:
+                return etree.tostring(omath_para, encoding='unicode')
             return etree.tostring(omath, encoding='unicode')
 
-        for obj_elem in root.findall('.//w:object',
-                                     namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
+        # Try to find MathType/Equation Editor object
+        for obj_elem in root.findall(f'.//{{{W_NS}}}object'):
             return etree.tostring(obj_elem, encoding='unicode')
+        
+        # Try alternative path for embedded objects
+        for pict_elem in root.findall(f'.//{{{W_NS}}}pict'):
+            # Check if this pict contains an equation
+            if 'OLEObject' in etree.tostring(pict_elem, encoding='unicode'):
+                return etree.tostring(pict_elem, encoding='unicode')
 
         return None
     except Exception as e:
@@ -513,20 +537,29 @@ def parse_paragraph_elements(p):
     elements = []
 
     for run in p.runs:
-        equation_xml = get_equation_xml(run)
-        if equation_xml:
-            elements.append(ContentElement('equation', equation_xml))
-            continue
-
-        if '<w:drawing>' in run.element.xml or '<w:pict>' in run.element.xml:
+        # Check for equations FIRST (before images)
+        if has_equation(run):
+            equation_xml = get_equation_xml(run)
+            if equation_xml:
+                elements.append(ContentElement('equation', equation_xml))
+                continue
+            else:
+                # Equation detected but couldn't extract, add placeholder
+                print(f'Cảnh báo: Phát hiện công thức nhưng không thể trích xuất')
+        
+        # Check for images (but not equation objects)
+        run_xml = run.element.xml
+        if ('<w:drawing>' in run_xml or '<w:pict>' in run_xml) and not has_equation(run):
             blob, dims = get_image_blob(p, run)
             if blob:
                 elements.append(ContentElement('image', blob, formatting=dims))
                 continue
 
-        if not run.text:
+        # Skip empty runs
+        if not run.text or not run.text.strip():
             continue
 
+        # Process text with formatting
         font_size_pt = None
         if run.font.size is not None:
             font_size_pt = run.font.size.pt
@@ -549,9 +582,10 @@ def parse_paragraph_elements(p):
         }
         elements.append(ContentElement('text', run.text, formatting))
 
-    if not p.runs:
+    # Add newline at the end
+    if not elements or (elements and elements[-1].type != 'text'):
         elements.append(ContentElement('text', '\n', {}))
-    else:
+    elif elements and elements[-1].data != '\n':
         elements.append(ContentElement('text', '\n', {}))
 
     return elements
@@ -612,12 +646,20 @@ def parse_word_doc(filepath):
             elif state in ['QUESTION', 'OPTION'] and current_question and current_question.type == 1:
                 if re.match(r'^[A-D]\.', p_text):
                     label = p_text[0]
-                    current_option = Option(original_label=label)
-                    if re.match(r'^[A-D]\.\s*\*', p_text):
-                        current_option.is_fixed = True
-                    current_question.options.append(current_option)
-                    current_option.content.extend(elements)
-                    state = 'OPTION'
+                    # Only accept if we haven't exceeded 4 options
+                    if len(current_question.options) >= 4:
+                        # This might be content, not a new option
+                        if current_option:
+                            if current_option.content:
+                                current_option.content.append(ContentElement('text', '\n', {}))
+                            current_option.content.extend(elements)
+                    else:
+                        current_option = Option(original_label=label)
+                        if re.match(r'^[A-D]\.\s*\*', p_text):
+                            current_option.is_fixed = True
+                        current_question.options.append(current_option)
+                        current_option.content.extend(elements)
+                        state = 'OPTION'
                 elif current_option:
                     if current_option.content:
                         current_option.content.append(ContentElement('text', '\n', {}))
@@ -630,10 +672,18 @@ def parse_word_doc(filepath):
             elif state in ['QUESTION', 'OPTION'] and current_question and current_question.type == 2:
                 if re.match(r'^[a-d]\)', p_text):
                     label = p_text[0]
-                    current_option = Option(original_label=label)
-                    current_question.options.append(current_option)
-                    current_option.content.extend(elements)
-                    state = 'OPTION'
+                    # Only accept if we haven't exceeded 4 options
+                    if len(current_question.options) >= 4:
+                        # This might be content, not a new option
+                        if current_option:
+                            if current_option.content:
+                                current_option.content.append(ContentElement('text', '\n', {}))
+                            current_option.content.extend(elements)
+                    else:
+                        current_option = Option(original_label=label)
+                        current_question.options.append(current_option)
+                        current_option.content.extend(elements)
+                        state = 'OPTION'
                 elif current_option:
                     if current_option.content:
                         current_option.content.append(ContentElement('text', '\n', {}))
@@ -643,15 +693,24 @@ def parse_word_doc(filepath):
                         current_question.question_body.append(ContentElement('text', '\n', {}))
                     current_question.question_body.extend(elements)
 
-            elif p_text.startswith('Lời giải:'):
+            elif 'Lời giải:' in p_text or 'Lời giải :' in p_text or p_text.strip().startswith('Lời giải'):
                 if current_question:
                     current_question.solution_body.extend(elements)
                     state = 'SOLUTION'
+                    current_option = None
 
-            elif p_text.startswith('Đáp án đúng:'):
+            elif 'Đáp án đúng:' in p_text or 'Đáp án đúng :' in p_text or p_text.strip().startswith('Đáp án'):
                 if current_question and current_question.type != 4:
-                    current_question.correct_answer = p_text.split(':', 1)[1].strip()
+                    # Extract answer after the colon
+                    if ':' in p_text:
+                        current_question.correct_answer = p_text.split(':', 1)[1].strip()
+                    else:
+                        # Try to extract from the text
+                        parts = p_text.split('đúng', 1)
+                        if len(parts) > 1:
+                            current_question.correct_answer = parts[1].strip()
                 state = 'ANSWER'
+                current_option = None
 
             else:
                 if not elements:
@@ -677,6 +736,78 @@ def parse_word_doc(filepath):
 
         if current_question:
             questions.append(current_question)
+
+        # Clean up questions - remove solution/answer content from question body
+        for q in questions:
+            # Remove "Lời giải:" and "Đáp án đúng:" from question body
+            cleaned_body = []
+            for el in q.question_body:
+                if el.type == 'text':
+                    text = el.data
+                    # Stop adding content if we hit solution markers
+                    if 'Lời giải' in text or 'Đáp án đúng' in text:
+                        # This element contains solution marker, stop here
+                        break
+                    cleaned_body.append(el)
+                else:
+                    cleaned_body.append(el)
+            q.question_body = cleaned_body
+            
+            # Clean up options
+            for opt in q.options:
+                cleaned_content = []
+                for el in opt.content:
+                    if el.type == 'text':
+                        text = el.data
+                        # Stop if we hit solution markers
+                        if 'Lời giải' in text or 'Đáp án đúng' in text:
+                            break
+                        cleaned_content.append(el)
+                    else:
+                        cleaned_content.append(el)
+                opt.content = cleaned_content
+
+        # Validate and clean questions
+        validated_questions = []
+        for q in questions:
+            is_valid = True
+            
+            # Validate MCQ (type 1)
+            if q.type == 1:
+                if len(q.options) > 4:
+                    print(f'Cảnh báo khi import: {q.original_number_text} có {len(q.options)} phương án (>4), sẽ chỉ lấy 4 phương án đầu')
+                    q.options = q.options[:4]
+                
+                if not q.options:
+                    print(f'Bỏ qua {q.original_number_text}: Không có phương án nào')
+                    is_valid = False
+                elif not q.correct_answer or not q.correct_answer.strip():
+                    print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là A')
+                    q.correct_answer = 'A'
+            
+            # Validate True/False (type 2)
+            elif q.type == 2:
+                if len(q.options) > 4:
+                    print(f'Cảnh báo khi import: {q.original_number_text} có {len(q.options)} phương án (>4), sẽ chỉ lấy 4 phương án đầu')
+                    q.options = q.options[:4]
+                
+                if not q.options:
+                    print(f'Bỏ qua {q.original_number_text}: Không có phương án nào')
+                    is_valid = False
+                elif not q.correct_answer or not q.correct_answer.strip():
+                    print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là "a"')
+                    q.correct_answer = 'a'
+            
+            # Validate Short Answer (type 3)
+            elif q.type == 3:
+                if not q.correct_answer or not q.correct_answer.strip():
+                    print(f'Cảnh báo: {q.original_number_text} không có đáp án')
+                    q.correct_answer = '(Không có đáp án)'
+            
+            if is_valid:
+                validated_questions.append(q)
+        
+        questions = validated_questions
 
         parts = []
         parts_dict = {1: [], 2: [], 3: [], 4: []}
@@ -741,49 +872,99 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
 
             try:
                 if part.type == 1:
-                    correct_opt = next(opt for opt in q.options if opt.original_label == q.correct_answer)
+                    # Validate and fix data
+                    new_labels = ['A', 'B', 'C', 'D']
+                    
+                    # Trim to max 4 options if needed
+                    if len(q.options) > len(new_labels):
+                        print(f'Cảnh báo: {q.original_number_text} có {len(q.options)} phương án, chỉ lấy 4 phương án đầu')
+                        q.options = q.options[:len(new_labels)]
+                    
+                    # Check if correct answer exists
+                    if not q.correct_answer or not q.correct_answer.strip():
+                        print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là A')
+                        q.correct_answer = 'A'
+                    
+                    # Find correct option
+                    correct_opt = None
+                    for opt in q.options:
+                        if opt.original_label == q.correct_answer:
+                            correct_opt = opt
+                            break
+                    
+                    # If not found, use first option as correct
+                    if correct_opt is None:
+                        if q.options:
+                            print(f'Cảnh báo: {q.original_number_text} - đáp án "{q.correct_answer}" không tồn tại, đặt mặc định là A')
+                            correct_opt = q.options[0]
+                            q.correct_answer = q.options[0].original_label
+                        else:
+                            raise Exception(f'{q.original_number_text} không có phương án nào')
 
                     if scramble_mcq_options_flag:
                         scramblable_options = [opt for opt in q.options if not opt.is_fixed]
                         fixed_options = [opt for opt in q.options if opt.is_fixed]
                         random.shuffle(scramblable_options)
                         q.options = scramblable_options + fixed_options
-
-                    new_labels = ['A', 'B', 'C', 'D']
+                    
                     new_correct_idx = q.options.index(correct_opt)
                     q.new_correct_answer = new_labels[new_correct_idx]
                     part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
 
                 elif part.type == 2:
+                    # Validate and fix data for True/False questions
+                    new_labels = ['a', 'b', 'c', 'd']
+                    
+                    # Trim to max 4 options if needed
+                    if len(q.options) > len(new_labels):
+                        print(f'Cảnh báo: {q.original_number_text} có {len(q.options)} phương án, chỉ lấy 4 phương án đầu')
+                        q.options = q.options[:len(new_labels)]
+                    
+                    # Check if correct answer exists and is valid
+                    if not q.correct_answer or not q.correct_answer.strip():
+                        print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là "a"')
+                        q.correct_answer = 'a'
+                    
                     if scramble_tf_options_flag and q.options:
                         try:
                             cleaned_answer = q.correct_answer.strip()
                             original_answers = re.split(r'[;,\s]+', cleaned_answer)
-                            original_answers = [ans for ans in original_answers if ans]
+                            original_answers = [ans.strip() for ans in original_answers if ans.strip()]
 
+                            # Validate that we have answers
+                            if not original_answers:
+                                print(f'Cảnh báo: {q.original_number_text} không có đáp án hợp lệ, đặt mặc định')
+                                original_answers = ['a']
+                            
+                            # If answers don't match options count, try to fix
                             if len(original_answers) != len(q.options):
-                                raise Exception(
-                                    f'Lỗi dữ liệu: {q.original_number_text} có {len(q.options)} phương án '
-                                    f'nhưng có {len(original_answers)} đáp án.'
-                                )
+                                print(f'Cảnh báo: {q.original_number_text} có {len(q.options)} phương án '
+                                      f'nhưng có {len(original_answers)} đáp án. Sử dụng đáp án có sẵn.')
+                                # Don't raise exception, just use what we have
+                                if not original_answers:
+                                    original_answers = [new_labels[i] for i in range(min(len(q.options), len(new_labels)))]
 
-                            new_labels = ['a', 'b', 'c', 'd']
+                            num_options = min(len(q.options), len(new_labels))
                             old_to_new = {}
 
-                            temp_options = q.options[:]
+                            temp_options = q.options[:num_options]
                             random.shuffle(temp_options)
                             q.options = temp_options
 
-                            for i, opt in enumerate(q.options):
-                                old_to_new[opt.original_label] = new_labels[i]
+                            for i in range(len(temp_options)):
+                                if i < len(new_labels):
+                                    opt = temp_options[i]
+                                    old_to_new[opt.original_label] = new_labels[i]
 
-                            new_answers = [old_to_new.get(ans, ans) for ans in original_answers]
+                            new_answers = [old_to_new.get(ans, ans) for ans in original_answers if ans in old_to_new]
+                            if not new_answers:
+                                new_answers = [new_labels[0]]
                             q.new_correct_answer = '; '.join(new_answers)
                         except Exception as e:
-                            print(f'Lỗi xáo trộn: {e}')
-                            q.new_correct_answer = q.correct_answer
+                            print(f'Lỗi xáo trộn {q.original_number_text}: {e}')
+                            q.new_correct_answer = q.correct_answer if q.correct_answer else 'a'
                     else:
-                        q.new_correct_answer = q.correct_answer
+                        q.new_correct_answer = q.correct_answer if q.correct_answer else 'a'
 
                     part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
 
@@ -797,10 +978,22 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
 
             except StopIteration:
                 print(f'Không tìm thấy đáp án: {q.original_number_text}')
-                q.new_correct_answer = q.correct_answer
+                if part.type == 1:
+                    q.new_correct_answer = 'A'
+                elif part.type == 2:
+                    q.new_correct_answer = 'a'
+                else:
+                    q.new_correct_answer = q.correct_answer if q.correct_answer else '(Không có đáp án)'
+                part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
             except Exception as e:
                 print(f'Lỗi xử lý câu {q.original_number_text}: {e}')
-                q.new_correct_answer = q.correct_answer
+                if part.type == 1:
+                    q.new_correct_answer = 'A'
+                elif part.type == 2:
+                    q.new_correct_answer = 'a'
+                else:
+                    q.new_correct_answer = q.correct_answer if q.correct_answer else '(Không có đáp án)'
+                part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
 
         answer_key[part_title] = part_key
 
@@ -812,16 +1005,31 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
 def insert_equation_xml(paragraph, equation_xml):
     """Chèn công thức toán học vào paragraph"""
     try:
+        # Parse the equation XML
         equation_elem = etree.fromstring(equation_xml.encode('utf-8'))
+        
+        # Create a new run
         run = paragraph.add_run()
-        run._element.append(equation_elem)
+        
+        # Make a deep copy to avoid modifying the original
+        equation_copy = copy.deepcopy(equation_elem)
+        
+        # Append the equation element to the run's element
+        run._element.append(equation_copy)
+        
+        return True
     except Exception as e:
         print(f'Lỗi chèn công thức: {e}')
-        run = paragraph.add_run('[CÔNG THỨC]')
+        
+        # Fallback: insert placeholder text
         try:
+            run = paragraph.add_run('[CÔNG THỨC]')
             run.font.color.rgb = RGBColor(255, 0, 0)
+            run.bold = True
         except:
-            pass
+            paragraph.add_run('[CT]')
+        
+        return False
 
 
 def apply_formatting(run, formatting):
@@ -868,60 +1076,54 @@ def write_elements_to_paragraph(p, elements, prefix=None):
         run = p.add_run(prefix)
         run.bold = True
 
-    text_buffer = ''
-    first_real_text_element_index = -1
     last_text_run = None
-
-    for i, el in enumerate(elements):
-        if el.type == 'text':
-            if first_real_text_element_index == -1 and el.data.strip():
-                first_real_text_element_index = i
-
-            if first_real_text_element_index == -1 or el.data == '\n':
-                continue
-
-            text_buffer += el.data
-
-            regex_pattern = r'^\s*((Câu\s*\d+\.?)|(Bài\s*\d+\.?)|([A-D]\.\s*\*?)|([a-d]\))|Lời giải:)\s*'
-
-            text_after_sub = re.sub(regex_pattern, '', text_buffer)
-
-            if text_after_sub != text_buffer:
-                for j in range(first_real_text_element_index, i + 1):
-                    current_el = elements[j]
-                    if current_el.type == 'text':
-                        if j == i:
-                            current_el.data = text_after_sub
-                        else:
-                            current_el.data = ''
-            else:
-                if text_buffer.strip():
-                    break
-        elif el.type in ['image', 'equation']:
-            if first_real_text_element_index == -1:
-                continue
-            break
-
+    first_text_written = False
+    
     for el in elements:
         if el.type == 'text':
             if el.data:
                 text = el.data
+                
+                # Only remove prefix from the very first text element
+                if not first_text_written and text.strip():
+                    # Remove question/option numbering from the beginning
+                    text = re.sub(r'^\s*(Câu\s*\d+[\.:)]?\s*)', '', text)
+                    text = re.sub(r'^\s*(Bài\s*\d+[\.:)]?\s*)', '', text)
+                    text = re.sub(r'^\s*([A-D][\.:)]\s*\*?\s*)', '', text)
+                    text = re.sub(r'^\s*([a-d]\)\s*)', '', text)
+                    text = re.sub(r'^\s*(Lời giải:\s*)', '', text)
+                    first_text_written = True
+                
+                # Clean up whitespace
                 text = re.sub(r'\n\s*\n+', '\n', text)
                 text = re.sub(r' +', ' ', text)
+                
+                # Skip if it's just whitespace or newline
+                if not text.strip():
+                    continue
 
-                if text.strip():
-                    run = p.add_run(text)
-                    apply_formatting(run, el.formatting)
-                    last_text_run = run
+                run = p.add_run(text)
+                apply_formatting(run, el.formatting)
+                last_text_run = run
 
         elif el.type == 'equation':
-            if last_text_run is not None:
+            # Add space before equation if there's previous text (but not if previous text ends with space)
+            if last_text_run is not None and last_text_run.text and not last_text_run.text.endswith(' '):
                 p.add_run(' ')
-            insert_equation_xml(p, el.data)
-            p.add_run(' ')
+            
+            # Insert the equation
+            success = insert_equation_xml(p, el.data)
+            
+            # Add space after equation
+            if success:
+                p.add_run(' ')
+            
+            last_text_run = None
+            first_text_written = True
 
         elif el.type == 'image':
             try:
+                # Add newline before image if there's previous content
                 if last_text_run is not None:
                     p.add_run('\n')
 
@@ -938,6 +1140,9 @@ def write_elements_to_paragraph(p, elements, prefix=None):
 
                 run.add_picture(io.BytesIO(image_data), width=pic_width, height=pic_height)
                 p.add_run('\n')
+                
+                last_text_run = None
+                first_text_written = True
 
             except Exception as e:
                 print(f'Không thể ghi hình ảnh: {e}')
@@ -983,42 +1188,88 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
 
             if part.type == 1:
                 new_labels = ['A', 'B', 'C', 'D']
-                for i, opt in enumerate(q.options):
-                    write_element_list_as_paragraphs(doc, opt.content, prefix=f'{new_labels[i]}. ')
+                # Ensure we don't exceed available labels
+                num_options = min(len(q.options), len(new_labels))
+                for i in range(num_options):
+                    if i >= len(q.options):
+                        break
+                    opt = q.options[i]
+                    # Check if option has content
+                    if not opt.content or all(el.type == 'text' and not el.data.strip() for el in opt.content):
+                        # Option is empty, add placeholder
+                        p = doc.add_paragraph()
+                        run = p.add_run(f'{new_labels[i]}. ')
+                        run.bold = True
+                        p.add_run('.')
+                    else:
+                        write_element_list_as_paragraphs(doc, opt.content, prefix=f'{new_labels[i]}. ')
 
             elif part.type == 2:
                 new_labels = ['a', 'b', 'c', 'd']
-                for i, opt in enumerate(q.options):
-                    if i >= len(new_labels):
+                # Ensure we don't exceed available labels
+                num_options = min(len(q.options), len(new_labels))
+                
+                for i in range(num_options):
+                    if i >= len(q.options):
                         break
-
+                        
+                    opt = q.options[i]
+                    
+                    # Check if option has content
+                    if not opt.content or all(el.type == 'text' and not el.data.strip() for el in opt.content):
+                        # Option is empty, add placeholder
+                        p_opt = doc.add_paragraph()
+                        run_label = p_opt.add_run(f'{new_labels[i]}) ')
+                        run_label.bold = True
+                        p_opt.add_run('.')
+                        continue
+                    
                     p_opt = doc.add_paragraph()
                     run_label = p_opt.add_run(f'{new_labels[i]}) ')
                     run_label.bold = True
 
+                    last_was_text = False
+                    first_el = True
+                    
                     for el in opt.content:
                         if el.type == 'text':
                             text = el.data
-                            text = re.sub(r'[a-d]\)\s*', '', text)
+                            
+                            # Only remove prefix from first text element
+                            if first_el:
+                                text = re.sub(r'^\s*[a-d]\)\s*', '', text)
+                                first_el = False
+                            
                             text = text.replace('\n', ' ').strip()
                             text = re.sub(r'\s+', ' ', text)
 
                             if text:
                                 run = p_opt.add_run(text)
                                 apply_formatting(run, el.formatting)
+                                last_was_text = True
 
                         elif el.type == 'equation':
+                            if last_was_text:
+                                p_opt.add_run(' ')
                             insert_equation_xml(p_opt, el.data)
+                            p_opt.add_run(' ')
+                            last_was_text = False
+                            first_el = False
 
                         elif el.type == 'image':
                             try:
+                                if last_was_text:
+                                    p_opt.add_run(' ')
                                 run = p_opt.add_run()
                                 pic_width = Emu(el.width) if el.width else None
                                 pic_height = Emu(el.height) if el.height else None
                                 if el.data and not isinstance(el.data, str):
                                     run.add_picture(io.BytesIO(el.data), width=pic_width, height=pic_height)
-                            except:
-                                pass
+                                    p_opt.add_run(' ')
+                                last_was_text = False
+                                first_el = False
+                            except Exception as e:
+                                print(f'Lỗi chèn ảnh: {e}')
 
             if write_solution:
                 if q.solution_body:
