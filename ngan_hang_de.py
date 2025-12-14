@@ -693,15 +693,24 @@ def parse_word_doc(filepath):
                         current_question.question_body.append(ContentElement('text', '\n', {}))
                     current_question.question_body.extend(elements)
 
-            elif p_text.startswith('Lời giải:'):
+            elif 'Lời giải:' in p_text or 'Lời giải :' in p_text or p_text.strip().startswith('Lời giải'):
                 if current_question:
                     current_question.solution_body.extend(elements)
                     state = 'SOLUTION'
+                    current_option = None
 
-            elif p_text.startswith('Đáp án đúng:'):
+            elif 'Đáp án đúng:' in p_text or 'Đáp án đúng :' in p_text or p_text.strip().startswith('Đáp án'):
                 if current_question and current_question.type != 4:
-                    current_question.correct_answer = p_text.split(':', 1)[1].strip()
+                    # Extract answer after the colon
+                    if ':' in p_text:
+                        current_question.correct_answer = p_text.split(':', 1)[1].strip()
+                    else:
+                        # Try to extract from the text
+                        parts = p_text.split('đúng', 1)
+                        if len(parts) > 1:
+                            current_question.correct_answer = parts[1].strip()
                 state = 'ANSWER'
+                current_option = None
 
             else:
                 if not elements:
@@ -727,6 +736,36 @@ def parse_word_doc(filepath):
 
         if current_question:
             questions.append(current_question)
+
+        # Clean up questions - remove solution/answer content from question body
+        for q in questions:
+            # Remove "Lời giải:" and "Đáp án đúng:" from question body
+            cleaned_body = []
+            for el in q.question_body:
+                if el.type == 'text':
+                    text = el.data
+                    # Stop adding content if we hit solution markers
+                    if 'Lời giải' in text or 'Đáp án đúng' in text:
+                        # This element contains solution marker, stop here
+                        break
+                    cleaned_body.append(el)
+                else:
+                    cleaned_body.append(el)
+            q.question_body = cleaned_body
+            
+            # Clean up options
+            for opt in q.options:
+                cleaned_content = []
+                for el in opt.content:
+                    if el.type == 'text':
+                        text = el.data
+                        # Stop if we hit solution markers
+                        if 'Lời giải' in text or 'Đáp án đúng' in text:
+                            break
+                        cleaned_content.append(el)
+                    else:
+                        cleaned_content.append(el)
+                opt.content = cleaned_content
 
         # Validate and clean questions
         validated_questions = []
@@ -1037,51 +1076,35 @@ def write_elements_to_paragraph(p, elements, prefix=None):
         run = p.add_run(prefix)
         run.bold = True
 
-    text_buffer = ''
-    first_real_text_element_index = -1
     last_text_run = None
-
-    for i, el in enumerate(elements):
-        if el.type == 'text':
-            if first_real_text_element_index == -1 and el.data.strip():
-                first_real_text_element_index = i
-
-            if first_real_text_element_index == -1 or el.data == '\n':
-                continue
-
-            text_buffer += el.data
-
-            regex_pattern = r'^\s*((Câu\s*\d+\.?)|(Bài\s*\d+\.?)|([A-D]\.\s*\*?)|([a-d]\))|Lời giải:)\s*'
-
-            text_after_sub = re.sub(regex_pattern, '', text_buffer)
-
-            if text_after_sub != text_buffer:
-                for j in range(first_real_text_element_index, i + 1):
-                    current_el = elements[j]
-                    if current_el.type == 'text':
-                        if j == i:
-                            current_el.data = text_after_sub
-                        else:
-                            current_el.data = ''
-            else:
-                if text_buffer.strip():
-                    break
-        elif el.type in ['image', 'equation']:
-            if first_real_text_element_index == -1:
-                continue
-            break
-
+    first_text_written = False
+    
     for el in elements:
         if el.type == 'text':
             if el.data:
                 text = el.data
+                
+                # Only remove prefix from the very first text element
+                if not first_text_written and text.strip():
+                    # Remove question/option numbering from the beginning
+                    text = re.sub(r'^\s*(Câu\s*\d+[\.:)]?\s*)', '', text)
+                    text = re.sub(r'^\s*(Bài\s*\d+[\.:)]?\s*)', '', text)
+                    text = re.sub(r'^\s*([A-D][\.:)]\s*\*?\s*)', '', text)
+                    text = re.sub(r'^\s*([a-d]\)\s*)', '', text)
+                    text = re.sub(r'^\s*(Lời giải:\s*)', '', text)
+                    first_text_written = True
+                
+                # Clean up whitespace
                 text = re.sub(r'\n\s*\n+', '\n', text)
                 text = re.sub(r' +', ' ', text)
+                
+                # Skip if it's just whitespace or newline
+                if not text.strip():
+                    continue
 
-                if text.strip():
-                    run = p.add_run(text)
-                    apply_formatting(run, el.formatting)
-                    last_text_run = run
+                run = p.add_run(text)
+                apply_formatting(run, el.formatting)
+                last_text_run = run
 
         elif el.type == 'equation':
             # Add space before equation if there's previous text (but not if previous text ends with space)
@@ -1096,6 +1119,7 @@ def write_elements_to_paragraph(p, elements, prefix=None):
                 p.add_run(' ')
             
             last_text_run = None
+            first_text_written = True
 
         elif el.type == 'image':
             try:
@@ -1118,6 +1142,7 @@ def write_elements_to_paragraph(p, elements, prefix=None):
                 p.add_run('\n')
                 
                 last_text_run = None
+                first_text_written = True
 
             except Exception as e:
                 print(f'Không thể ghi hình ảnh: {e}')
@@ -1169,7 +1194,15 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
                     if i >= len(q.options):
                         break
                     opt = q.options[i]
-                    write_element_list_as_paragraphs(doc, opt.content, prefix=f'{new_labels[i]}. ')
+                    # Check if option has content
+                    if not opt.content or all(el.type == 'text' and not el.data.strip() for el in opt.content):
+                        # Option is empty, add placeholder
+                        p = doc.add_paragraph()
+                        run = p.add_run(f'{new_labels[i]}. ')
+                        run.bold = True
+                        p.add_run('.')
+                    else:
+                        write_element_list_as_paragraphs(doc, opt.content, prefix=f'{new_labels[i]}. ')
 
             elif part.type == 2:
                 new_labels = ['a', 'b', 'c', 'd']
@@ -1181,15 +1214,32 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
                         break
                         
                     opt = q.options[i]
+                    
+                    # Check if option has content
+                    if not opt.content or all(el.type == 'text' and not el.data.strip() for el in opt.content):
+                        # Option is empty, add placeholder
+                        p_opt = doc.add_paragraph()
+                        run_label = p_opt.add_run(f'{new_labels[i]}) ')
+                        run_label.bold = True
+                        p_opt.add_run('.')
+                        continue
+                    
                     p_opt = doc.add_paragraph()
                     run_label = p_opt.add_run(f'{new_labels[i]}) ')
                     run_label.bold = True
 
                     last_was_text = False
+                    first_el = True
+                    
                     for el in opt.content:
                         if el.type == 'text':
                             text = el.data
-                            text = re.sub(r'[a-d]\)\s*', '', text)
+                            
+                            # Only remove prefix from first text element
+                            if first_el:
+                                text = re.sub(r'^\s*[a-d]\)\s*', '', text)
+                                first_el = False
+                            
                             text = text.replace('\n', ' ').strip()
                             text = re.sub(r'\s+', ' ', text)
 
@@ -1204,6 +1254,7 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
                             insert_equation_xml(p_opt, el.data)
                             p_opt.add_run(' ')
                             last_was_text = False
+                            first_el = False
 
                         elif el.type == 'image':
                             try:
@@ -1216,6 +1267,7 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
                                     run.add_picture(io.BytesIO(el.data), width=pic_width, height=pic_height)
                                     p_opt.add_run(' ')
                                 last_was_text = False
+                                first_el = False
                             except Exception as e:
                                 print(f'Lỗi chèn ảnh: {e}')
 
