@@ -750,8 +750,15 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
                         q.options = scramblable_options + fixed_options
 
                     new_labels = ['A', 'B', 'C', 'D']
+                    # Ensure we don't exceed available labels
+                    if len(q.options) > len(new_labels):
+                        q.options = q.options[:len(new_labels)]
+                    
                     new_correct_idx = q.options.index(correct_opt)
-                    q.new_correct_answer = new_labels[new_correct_idx]
+                    if new_correct_idx < len(new_labels):
+                        q.new_correct_answer = new_labels[new_correct_idx]
+                    else:
+                        q.new_correct_answer = q.correct_answer
                     part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
 
                 elif part.type == 2:
@@ -768,14 +775,18 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
                                 )
 
                             new_labels = ['a', 'b', 'c', 'd']
+                            # Limit to available labels
+                            num_options = min(len(q.options), len(new_labels))
                             old_to_new = {}
 
-                            temp_options = q.options[:]
+                            temp_options = q.options[:num_options]
                             random.shuffle(temp_options)
                             q.options = temp_options
 
-                            for i, opt in enumerate(q.options):
-                                old_to_new[opt.original_label] = new_labels[i]
+                            for i in range(len(temp_options)):
+                                if i < len(new_labels):
+                                    opt = temp_options[i]
+                                    old_to_new[opt.original_label] = new_labels[i]
 
                             new_answers = [old_to_new.get(ans, ans) for ans in original_answers]
                             q.new_correct_answer = '; '.join(new_answers)
@@ -983,15 +994,24 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
 
             if part.type == 1:
                 new_labels = ['A', 'B', 'C', 'D']
-                for i, opt in enumerate(q.options):
+                # Ensure we don't exceed available labels
+                num_options = min(len(q.options), len(new_labels))
+                for i in range(num_options):
+                    if i >= len(q.options):
+                        break
+                    opt = q.options[i]
                     write_element_list_as_paragraphs(doc, opt.content, prefix=f'{new_labels[i]}. ')
 
             elif part.type == 2:
                 new_labels = ['a', 'b', 'c', 'd']
-                for i, opt in enumerate(q.options):
-                    if i >= len(new_labels):
+                # Ensure we don't exceed available labels
+                num_options = min(len(q.options), len(new_labels))
+                
+                for i in range(num_options):
+                    if i >= len(q.options):
                         break
-
+                        
+                    opt = q.options[i]
                     p_opt = doc.add_paragraph()
                     run_label = p_opt.add_run(f'{new_labels[i]}) ')
                     run_label.bold = True
