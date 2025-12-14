@@ -612,12 +612,20 @@ def parse_word_doc(filepath):
             elif state in ['QUESTION', 'OPTION'] and current_question and current_question.type == 1:
                 if re.match(r'^[A-D]\.', p_text):
                     label = p_text[0]
-                    current_option = Option(original_label=label)
-                    if re.match(r'^[A-D]\.\s*\*', p_text):
-                        current_option.is_fixed = True
-                    current_question.options.append(current_option)
-                    current_option.content.extend(elements)
-                    state = 'OPTION'
+                    # Only accept if we haven't exceeded 4 options
+                    if len(current_question.options) >= 4:
+                        # This might be content, not a new option
+                        if current_option:
+                            if current_option.content:
+                                current_option.content.append(ContentElement('text', '\n', {}))
+                            current_option.content.extend(elements)
+                    else:
+                        current_option = Option(original_label=label)
+                        if re.match(r'^[A-D]\.\s*\*', p_text):
+                            current_option.is_fixed = True
+                        current_question.options.append(current_option)
+                        current_option.content.extend(elements)
+                        state = 'OPTION'
                 elif current_option:
                     if current_option.content:
                         current_option.content.append(ContentElement('text', '\n', {}))
@@ -630,10 +638,18 @@ def parse_word_doc(filepath):
             elif state in ['QUESTION', 'OPTION'] and current_question and current_question.type == 2:
                 if re.match(r'^[a-d]\)', p_text):
                     label = p_text[0]
-                    current_option = Option(original_label=label)
-                    current_question.options.append(current_option)
-                    current_option.content.extend(elements)
-                    state = 'OPTION'
+                    # Only accept if we haven't exceeded 4 options
+                    if len(current_question.options) >= 4:
+                        # This might be content, not a new option
+                        if current_option:
+                            if current_option.content:
+                                current_option.content.append(ContentElement('text', '\n', {}))
+                            current_option.content.extend(elements)
+                    else:
+                        current_option = Option(original_label=label)
+                        current_question.options.append(current_option)
+                        current_option.content.extend(elements)
+                        state = 'OPTION'
                 elif current_option:
                     if current_option.content:
                         current_option.content.append(ContentElement('text', '\n', {}))
@@ -677,6 +693,48 @@ def parse_word_doc(filepath):
 
         if current_question:
             questions.append(current_question)
+
+        # Validate and clean questions
+        validated_questions = []
+        for q in questions:
+            is_valid = True
+            
+            # Validate MCQ (type 1)
+            if q.type == 1:
+                if len(q.options) > 4:
+                    print(f'Cảnh báo khi import: {q.original_number_text} có {len(q.options)} phương án (>4), sẽ chỉ lấy 4 phương án đầu')
+                    q.options = q.options[:4]
+                
+                if not q.options:
+                    print(f'Bỏ qua {q.original_number_text}: Không có phương án nào')
+                    is_valid = False
+                elif not q.correct_answer or not q.correct_answer.strip():
+                    print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là A')
+                    q.correct_answer = 'A'
+            
+            # Validate True/False (type 2)
+            elif q.type == 2:
+                if len(q.options) > 4:
+                    print(f'Cảnh báo khi import: {q.original_number_text} có {len(q.options)} phương án (>4), sẽ chỉ lấy 4 phương án đầu')
+                    q.options = q.options[:4]
+                
+                if not q.options:
+                    print(f'Bỏ qua {q.original_number_text}: Không có phương án nào')
+                    is_valid = False
+                elif not q.correct_answer or not q.correct_answer.strip():
+                    print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là "a"')
+                    q.correct_answer = 'a'
+            
+            # Validate Short Answer (type 3)
+            elif q.type == 3:
+                if not q.correct_answer or not q.correct_answer.strip():
+                    print(f'Cảnh báo: {q.original_number_text} không có đáp án')
+                    q.correct_answer = '(Không có đáp án)'
+            
+            if is_valid:
+                validated_questions.append(q)
+        
+        questions = validated_questions
 
         parts = []
         parts_dict = {1: [], 2: [], 3: [], 4: []}
@@ -741,41 +799,78 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
 
             try:
                 if part.type == 1:
-                    correct_opt = next(opt for opt in q.options if opt.original_label == q.correct_answer)
+                    # Validate and fix data
+                    new_labels = ['A', 'B', 'C', 'D']
+                    
+                    # Trim to max 4 options if needed
+                    if len(q.options) > len(new_labels):
+                        print(f'Cảnh báo: {q.original_number_text} có {len(q.options)} phương án, chỉ lấy 4 phương án đầu')
+                        q.options = q.options[:len(new_labels)]
+                    
+                    # Check if correct answer exists
+                    if not q.correct_answer or not q.correct_answer.strip():
+                        print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là A')
+                        q.correct_answer = 'A'
+                    
+                    # Find correct option
+                    correct_opt = None
+                    for opt in q.options:
+                        if opt.original_label == q.correct_answer:
+                            correct_opt = opt
+                            break
+                    
+                    # If not found, use first option as correct
+                    if correct_opt is None:
+                        if q.options:
+                            print(f'Cảnh báo: {q.original_number_text} - đáp án "{q.correct_answer}" không tồn tại, đặt mặc định là A')
+                            correct_opt = q.options[0]
+                            q.correct_answer = q.options[0].original_label
+                        else:
+                            raise Exception(f'{q.original_number_text} không có phương án nào')
 
                     if scramble_mcq_options_flag:
                         scramblable_options = [opt for opt in q.options if not opt.is_fixed]
                         fixed_options = [opt for opt in q.options if opt.is_fixed]
                         random.shuffle(scramblable_options)
                         q.options = scramblable_options + fixed_options
-
-                    new_labels = ['A', 'B', 'C', 'D']
-                    # Ensure we don't exceed available labels
-                    if len(q.options) > len(new_labels):
-                        q.options = q.options[:len(new_labels)]
                     
                     new_correct_idx = q.options.index(correct_opt)
-                    if new_correct_idx < len(new_labels):
-                        q.new_correct_answer = new_labels[new_correct_idx]
-                    else:
-                        q.new_correct_answer = q.correct_answer
+                    q.new_correct_answer = new_labels[new_correct_idx]
                     part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
 
                 elif part.type == 2:
+                    # Validate and fix data for True/False questions
+                    new_labels = ['a', 'b', 'c', 'd']
+                    
+                    # Trim to max 4 options if needed
+                    if len(q.options) > len(new_labels):
+                        print(f'Cảnh báo: {q.original_number_text} có {len(q.options)} phương án, chỉ lấy 4 phương án đầu')
+                        q.options = q.options[:len(new_labels)]
+                    
+                    # Check if correct answer exists and is valid
+                    if not q.correct_answer or not q.correct_answer.strip():
+                        print(f'Cảnh báo: {q.original_number_text} không có đáp án đúng, đặt mặc định là "a"')
+                        q.correct_answer = 'a'
+                    
                     if scramble_tf_options_flag and q.options:
                         try:
                             cleaned_answer = q.correct_answer.strip()
                             original_answers = re.split(r'[;,\s]+', cleaned_answer)
-                            original_answers = [ans for ans in original_answers if ans]
+                            original_answers = [ans.strip() for ans in original_answers if ans.strip()]
 
+                            # Validate that we have answers
+                            if not original_answers:
+                                print(f'Cảnh báo: {q.original_number_text} không có đáp án hợp lệ, đặt mặc định')
+                                original_answers = ['a']
+                            
+                            # If answers don't match options count, try to fix
                             if len(original_answers) != len(q.options):
-                                raise Exception(
-                                    f'Lỗi dữ liệu: {q.original_number_text} có {len(q.options)} phương án '
-                                    f'nhưng có {len(original_answers)} đáp án.'
-                                )
+                                print(f'Cảnh báo: {q.original_number_text} có {len(q.options)} phương án '
+                                      f'nhưng có {len(original_answers)} đáp án. Sử dụng đáp án có sẵn.')
+                                # Don't raise exception, just use what we have
+                                if not original_answers:
+                                    original_answers = [new_labels[i] for i in range(min(len(q.options), len(new_labels)))]
 
-                            new_labels = ['a', 'b', 'c', 'd']
-                            # Limit to available labels
                             num_options = min(len(q.options), len(new_labels))
                             old_to_new = {}
 
@@ -788,13 +883,15 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
                                     opt = temp_options[i]
                                     old_to_new[opt.original_label] = new_labels[i]
 
-                            new_answers = [old_to_new.get(ans, ans) for ans in original_answers]
+                            new_answers = [old_to_new.get(ans, ans) for ans in original_answers if ans in old_to_new]
+                            if not new_answers:
+                                new_answers = [new_labels[0]]
                             q.new_correct_answer = '; '.join(new_answers)
                         except Exception as e:
-                            print(f'Lỗi xáo trộn: {e}')
-                            q.new_correct_answer = q.correct_answer
+                            print(f'Lỗi xáo trộn {q.original_number_text}: {e}')
+                            q.new_correct_answer = q.correct_answer if q.correct_answer else 'a'
                     else:
-                        q.new_correct_answer = q.correct_answer
+                        q.new_correct_answer = q.correct_answer if q.correct_answer else 'a'
 
                     part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
 
@@ -808,10 +905,22 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
 
             except StopIteration:
                 print(f'Không tìm thấy đáp án: {q.original_number_text}')
-                q.new_correct_answer = q.correct_answer
+                if part.type == 1:
+                    q.new_correct_answer = 'A'
+                elif part.type == 2:
+                    q.new_correct_answer = 'a'
+                else:
+                    q.new_correct_answer = q.correct_answer if q.correct_answer else '(Không có đáp án)'
+                part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
             except Exception as e:
                 print(f'Lỗi xử lý câu {q.original_number_text}: {e}')
-                q.new_correct_answer = q.correct_answer
+                if part.type == 1:
+                    q.new_correct_answer = 'A'
+                elif part.type == 2:
+                    q.new_correct_answer = 'a'
+                else:
+                    q.new_correct_answer = q.correct_answer if q.correct_answer else '(Không có đáp án)'
+                part_key.append(f'{new_idx + 1}. {q.new_correct_answer}')
 
         answer_key[part_title] = part_key
 
