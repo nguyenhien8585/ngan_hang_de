@@ -430,21 +430,45 @@ def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 
+def has_equation(run):
+    """Kiểm tra xem run có chứa công thức hay không"""
+    try:
+        xml_str = run.element.xml
+        return ('<m:oMath' in xml_str or 
+                '<m:oMathPara' in xml_str or 
+                '<w:object' in xml_str and '<o:OLEObject' in xml_str)
+    except:
+        return False
+
+
 def get_equation_xml(run):
     """Trích xuất XML của công thức toán học (Equation/MathType)"""
     try:
         xml_str = run.element.xml
         root = etree.fromstring(xml_str)
 
+        # Namespace definitions
         MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
-
+        W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        
+        # Try to find Office Math (modern equations)
         omath = root.find(f'.//{{{MATH_NS}}}oMath')
         if omath is not None:
+            # Return the entire parent element to preserve structure
+            omath_para = root.find(f'.//{{{MATH_NS}}}oMathPara')
+            if omath_para is not None:
+                return etree.tostring(omath_para, encoding='unicode')
             return etree.tostring(omath, encoding='unicode')
 
-        for obj_elem in root.findall('.//w:object',
-                                     namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}):
+        # Try to find MathType/Equation Editor object
+        for obj_elem in root.findall(f'.//{{{W_NS}}}object'):
             return etree.tostring(obj_elem, encoding='unicode')
+        
+        # Try alternative path for embedded objects
+        for pict_elem in root.findall(f'.//{{{W_NS}}}pict'):
+            # Check if this pict contains an equation
+            if 'OLEObject' in etree.tostring(pict_elem, encoding='unicode'):
+                return etree.tostring(pict_elem, encoding='unicode')
 
         return None
     except Exception as e:
@@ -513,20 +537,29 @@ def parse_paragraph_elements(p):
     elements = []
 
     for run in p.runs:
-        equation_xml = get_equation_xml(run)
-        if equation_xml:
-            elements.append(ContentElement('equation', equation_xml))
-            continue
-
-        if '<w:drawing>' in run.element.xml or '<w:pict>' in run.element.xml:
+        # Check for equations FIRST (before images)
+        if has_equation(run):
+            equation_xml = get_equation_xml(run)
+            if equation_xml:
+                elements.append(ContentElement('equation', equation_xml))
+                continue
+            else:
+                # Equation detected but couldn't extract, add placeholder
+                print(f'Cảnh báo: Phát hiện công thức nhưng không thể trích xuất')
+        
+        # Check for images (but not equation objects)
+        run_xml = run.element.xml
+        if ('<w:drawing>' in run_xml or '<w:pict>' in run_xml) and not has_equation(run):
             blob, dims = get_image_blob(p, run)
             if blob:
                 elements.append(ContentElement('image', blob, formatting=dims))
                 continue
 
-        if not run.text:
+        # Skip empty runs
+        if not run.text or not run.text.strip():
             continue
 
+        # Process text with formatting
         font_size_pt = None
         if run.font.size is not None:
             font_size_pt = run.font.size.pt
@@ -549,9 +582,10 @@ def parse_paragraph_elements(p):
         }
         elements.append(ContentElement('text', run.text, formatting))
 
-    if not p.runs:
+    # Add newline at the end
+    if not elements or (elements and elements[-1].type != 'text'):
         elements.append(ContentElement('text', '\n', {}))
-    else:
+    elif elements and elements[-1].data != '\n':
         elements.append(ContentElement('text', '\n', {}))
 
     return elements
@@ -932,16 +966,31 @@ def scramble_data(original_parts, scramble_parts_flag, scramble_questions_flag,
 def insert_equation_xml(paragraph, equation_xml):
     """Chèn công thức toán học vào paragraph"""
     try:
+        # Parse the equation XML
         equation_elem = etree.fromstring(equation_xml.encode('utf-8'))
+        
+        # Create a new run
         run = paragraph.add_run()
-        run._element.append(equation_elem)
+        
+        # Make a deep copy to avoid modifying the original
+        equation_copy = copy.deepcopy(equation_elem)
+        
+        # Append the equation element to the run's element
+        run._element.append(equation_copy)
+        
+        return True
     except Exception as e:
         print(f'Lỗi chèn công thức: {e}')
-        run = paragraph.add_run('[CÔNG THỨC]')
+        
+        # Fallback: insert placeholder text
         try:
+            run = paragraph.add_run('[CÔNG THỨC]')
             run.font.color.rgb = RGBColor(255, 0, 0)
+            run.bold = True
         except:
-            pass
+            paragraph.add_run('[CT]')
+        
+        return False
 
 
 def apply_formatting(run, formatting):
@@ -1035,13 +1084,22 @@ def write_elements_to_paragraph(p, elements, prefix=None):
                     last_text_run = run
 
         elif el.type == 'equation':
-            if last_text_run is not None:
+            # Add space before equation if there's previous text (but not if previous text ends with space)
+            if last_text_run is not None and last_text_run.text and not last_text_run.text.endswith(' '):
                 p.add_run(' ')
-            insert_equation_xml(p, el.data)
-            p.add_run(' ')
+            
+            # Insert the equation
+            success = insert_equation_xml(p, el.data)
+            
+            # Add space after equation
+            if success:
+                p.add_run(' ')
+            
+            last_text_run = None
 
         elif el.type == 'image':
             try:
+                # Add newline before image if there's previous content
                 if last_text_run is not None:
                     p.add_run('\n')
 
@@ -1058,6 +1116,8 @@ def write_elements_to_paragraph(p, elements, prefix=None):
 
                 run.add_picture(io.BytesIO(image_data), width=pic_width, height=pic_height)
                 p.add_run('\n')
+                
+                last_text_run = None
 
             except Exception as e:
                 print(f'Không thể ghi hình ảnh: {e}')
@@ -1125,6 +1185,7 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
                     run_label = p_opt.add_run(f'{new_labels[i]}) ')
                     run_label.bold = True
 
+                    last_was_text = False
                     for el in opt.content:
                         if el.type == 'text':
                             text = el.data
@@ -1135,19 +1196,28 @@ def write_new_doc(filepath, parts, write_solution=False, exam_code=None):
                             if text:
                                 run = p_opt.add_run(text)
                                 apply_formatting(run, el.formatting)
+                                last_was_text = True
 
                         elif el.type == 'equation':
+                            if last_was_text:
+                                p_opt.add_run(' ')
                             insert_equation_xml(p_opt, el.data)
+                            p_opt.add_run(' ')
+                            last_was_text = False
 
                         elif el.type == 'image':
                             try:
+                                if last_was_text:
+                                    p_opt.add_run(' ')
                                 run = p_opt.add_run()
                                 pic_width = Emu(el.width) if el.width else None
                                 pic_height = Emu(el.height) if el.height else None
                                 if el.data and not isinstance(el.data, str):
                                     run.add_picture(io.BytesIO(el.data), width=pic_width, height=pic_height)
-                            except:
-                                pass
+                                    p_opt.add_run(' ')
+                                last_was_text = False
+                            except Exception as e:
+                                print(f'Lỗi chèn ảnh: {e}')
 
             if write_solution:
                 if q.solution_body:
